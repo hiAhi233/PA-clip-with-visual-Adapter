@@ -6,6 +6,7 @@
     - 病灶 cell 与背景 cell 的 amap 均值差
 """
 
+import argparse
 import sys
 
 import numpy as np
@@ -13,9 +14,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from text_side_anomaly.config import Config
-from text_side_anomaly.model import TextSideAnomalyModel
+from text_side_anomaly.model import (
+    TextSideAnomalyModel,
+    _is_v2_checkpoint,
+    _torch_load,
+)
 from text_side_anomaly.thymoma_dataset import ThymomaSliceDataset, make_slice_splits
-from thymoma_local import THYMOMA_PROMPTS
+from text_side_anomaly.prompts import resolve_prompt_set
+from thymoma_local import PROMPT_SETS
 
 
 def main():
@@ -24,11 +30,31 @@ def main():
     except Exception:
         pass
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg = Config(device=str(device))
-    model = TextSideAnomalyModel(cfg).to(device)
-    model.load_state_dict(torch.load("thymoma_local.pt", map_location=device))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", default="thymoma_local.pt")
+    parser.add_argument("--prompt-set", choices=sorted(PROMPT_SETS), default=None)
+    args = parser.parse_args()
+    ckpt = args.ckpt
+    blob = _torch_load(ckpt, map_location="cpu")
+    prompt_name = resolve_prompt_set(
+        args.prompt_set, blob.get("prompt_set") if _is_v2_checkpoint(blob) else None,
+        PROMPT_SETS, "sentence", loading=True,
+    )
+    anchors = PROMPT_SETS[prompt_name]
+    if _is_v2_checkpoint(blob):
+        model = TextSideAnomalyModel.from_arch_spec(blob["config"], device=str(device))
+        model.load_checkpoint_blob(blob)
+        if list(anchors.levels) != list(model.cfg.levels):
+            raise RuntimeError(
+                f"提示词 {prompt_name} 的层 {list(anchors.levels)} 与 checkpoint 的 {list(model.cfg.levels)} 不一致"
+            )
+        print(f"已按 checkpoint 架构加载 stage={model.training_stage} prompt={prompt_name}")
+    else:
+        cfg = Config(device=str(device), levels=anchors.levels)
+        model = TextSideAnomalyModel(cfg).to(device)
+        model.load_checkpoint_blob(blob)
+    del blob
     model.eval()
-    anchors = THYMOMA_PROMPTS
     enc = model.encode_anchors(anchors)
 
     splits = make_slice_splits("thymoma_slices", seed=0)
@@ -58,6 +84,8 @@ def main():
             n += 1
 
     print(f"测试切片数（含病灶）: {n}")
+    if n == 0:
+        raise ValueError("测试集没有含病灶的切片，无法计算命中率")
     print(f"top-1 命中率（最热 cell 落在肿瘤内）: {top1_hit / n:.3f}")
     print(f"top-k 命中率（k=肿瘤 cell 数）: {topk_hit / n:.3f}")
     print(f"病灶 cell amap 均值: {np.mean(pos_means):+.4f}  vs  背景 cell amap 均值: {np.mean(neg_means):+.4f}")

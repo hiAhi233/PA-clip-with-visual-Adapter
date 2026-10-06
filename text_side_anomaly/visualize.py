@@ -11,45 +11,11 @@
    让异常边界贴着解剖结构走，这是 paclip 的做法。
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-
-# ---------------------------------------------------------------------- #
-# 引导滤波
-# ---------------------------------------------------------------------- #
-def _box_filter(x: np.ndarray, r: int) -> np.ndarray:
-    """积分图实现的均值滤波（O(1) per pixel，与半径无关）。"""
-    h, w = x.shape
-    cs = np.pad(np.cumsum(np.cumsum(x, axis=0), axis=1), ((1, 0), (1, 0)))
-    ys, xs = np.arange(h), np.arange(w)
-    y0, y1 = np.clip(ys - r, 0, h - 1), np.clip(ys + r + 1, 0, h)
-    x0, x1 = np.clip(xs - r, 0, w - 1), np.clip(xs + r + 1, 0, w)
-    s = (cs[np.ix_(y1, x1)] - cs[np.ix_(y0, x1)]
-         - cs[np.ix_(y1, x0)] + cs[np.ix_(y0, x0)])
-    area = ((y1 - y0)[:, None] * (x1 - x0)[None, :]).astype(np.float32)
-    return (s / area).astype(np.float32)
-
-
-def guided_filter(guide: np.ndarray, src: np.ndarray,
-                  radius: int = 4, eps: float = 1e-3) -> np.ndarray:
-    """引导滤波（He et al.）：以 guide 的边缘为准，对 src 做保边平滑。
-
-    Args:
-        guide: (H, W) 引导图，值域 [0, 1]（这里用原灰度图）。
-        src: (H, W) 待滤波图，与 guide 同尺寸。
-        radius: 滤波窗口半径。
-        eps: 正则项，越大越平滑。
-    """
-    mi, mp = _box_filter(guide, radius), _box_filter(src, radius)
-    mip = _box_filter(guide * src, radius)
-    mii = _box_filter(guide * guide, radius)
-    cov_ip = mip - mi * mp
-    var_i = mii - mi * mi
-    a = cov_ip / (var_i + eps)
-    b = mp - a * mi
-    return _box_filter(a, radius) * guide + _box_filter(b, radius)
+from .postprocess import guided_filter
 
 
 def upsample_guided(amap: np.ndarray, guide: np.ndarray,
@@ -179,6 +145,156 @@ def colorize(norm01: np.ndarray, gray: np.ndarray, gt: Optional[np.ndarray] = No
                   "请确认 gt 是 0/255 的 uint8 —— 0/1 的 mask 会静默画不出线。",
                   file=sys.stderr)
     return out
+
+
+def as_binary_mask(mask) -> np.ndarray:
+    """0/1 和 0/255 都变成 bool。不能用 >127，否则 0/1 掩码会消失。"""
+    values = np.asarray(mask)
+    if values.size == 0:
+        return values.astype(bool)
+    return values > 0
+
+
+def binary_contour(mask) -> np.ndarray:
+    """由 bool 掩码得到一圈边界。全零掩码返回全零，不把它当成绘图错误。"""
+    binary = as_binary_mask(mask)
+    if not binary.any():
+        return np.zeros(binary.shape, dtype=bool)
+    padded = np.pad(binary, 1, constant_values=False)
+    neighbors = (
+        padded[:-2, 1:-1]
+        & padded[2:, 1:-1]
+        & padded[1:-1, :-2]
+        & padded[1:-1, 2:]
+    )
+    return binary & ~neighbors
+
+
+def paint_contour(rgb: np.ndarray, mask, color=(0, 255, 0)) -> np.ndarray:
+    edge = binary_contour(mask)
+    if edge.shape != rgb.shape[:2]:
+        raise ValueError("轮廓掩码必须与图像同尺寸")
+    out = np.array(rgb, copy=True)
+    out[edge] = color
+    return out
+
+
+def _resize(image: np.ndarray, size: int, resample: str) -> np.ndarray:
+    from PIL import Image
+
+    mode = "F" if image.dtype != np.uint8 and image.ndim == 2 else None
+    if image.ndim == 2 and image.dtype != np.uint8:
+        source = Image.fromarray(image.astype(np.float32), mode="F")
+        resized = source.resize((size, size), Image.BILINEAR if resample == "bilinear" else Image.NEAREST)
+        return np.asarray(resized, dtype=np.float32)
+    source = Image.fromarray(image.astype(np.uint8) if image.dtype == np.uint8 or image.ndim == 3 else image)
+    method = Image.BILINEAR if resample == "bilinear" else Image.NEAREST
+    return np.asarray(source.resize((size, size), method))
+
+
+def _heat_rgb(gray01: np.ndarray, score01: np.ndarray, alpha: float, vmin: float, vmax: float) -> np.ndarray:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.cm as cm
+
+    span = max(float(vmax) - float(vmin), 1e-6)
+    norm = np.clip((np.asarray(score01, dtype=np.float32) - float(vmin)) / span, 0.0, 1.0)
+    heat = (cm.jet(norm)[..., :3] * 255).astype(np.float32)
+    gray = np.clip(np.asarray(gray01, dtype=np.float32), 0.0, 1.0)
+    base = np.stack([gray, gray, gray], axis=-1) * 255.0
+    return ((1.0 - alpha) * base + alpha * heat).astype(np.uint8)
+
+
+def render_four_panel(gray01, score_map_high, pred_mask, gt_mask, gt_available: bool,
+                      panel_size: int = 256, vmin: float = 0.0, vmax: float = 1.0,
+                      mask_status: str = "predicted", sample_title: str = "") -> np.ndarray:
+    """四列：原图、热图、热图+GT、预测掩码+GT。不重新推理，也不按 GT 改分数。"""
+    from PIL import Image, ImageDraw
+
+    gray = np.clip(np.asarray(gray01, dtype=np.float32), 0.0, 1.0)
+    score = np.asarray(score_map_high, dtype=np.float32)
+    if gray.shape != score.shape:
+        raise ValueError("原图与热图尺寸必须一致")
+    gray_show = _resize(gray, panel_size, "bilinear")
+    score_show = _resize(score, panel_size, "bilinear")
+    heat = _heat_rgb(gray_show, score_show, alpha=0.45, vmin=vmin, vmax=vmax)
+    original = (np.stack([gray_show] * 3, axis=-1) * 255).astype(np.uint8)
+    heat_gt = heat.copy()
+    mask_panel = original.copy()
+    gt_bool = None if gt_mask is None or not gt_available else as_binary_mask(gt_mask)
+    if gt_bool is not None and gt_bool.shape != gray.shape:
+        gt_bool = as_binary_mask(_resize(gt_bool.astype(np.uint8) * 255, panel_size, "nearest"))
+    elif gt_bool is not None:
+        gt_bool = as_binary_mask(_resize(gt_bool.astype(np.uint8) * 255, panel_size, "nearest"))
+    if gt_available and gt_bool is not None and gt_bool.any():
+        heat_gt = paint_contour(heat_gt, gt_bool)
+    if pred_mask is None or mask_status == "unavailable":
+        mask_panel = np.zeros_like(original)
+    else:
+        pred = as_binary_mask(pred_mask)
+        pred = as_binary_mask(_resize(pred.astype(np.uint8) * 255, panel_size, "nearest"))
+        red = mask_panel.astype(np.float32)
+        red[pred] = red[pred] * 0.65 + np.array([255, 0, 0], dtype=np.float32) * 0.35
+        mask_panel = red.astype(np.uint8)
+        if gt_available and gt_bool is not None and gt_bool.any():
+            mask_panel = paint_contour(mask_panel, gt_bool)
+    gap = 8
+    header = 36
+    width = panel_size * 4 + gap * 3
+    canvas = Image.new("RGB", (width, panel_size + header), (0, 0, 0))
+    frames = [original, heat, heat_gt, mask_panel]
+    for index, frame in enumerate(frames):
+        canvas.paste(Image.fromarray(frame), (index * (panel_size + gap), header))
+    draw = ImageDraw.Draw(canvas)
+    font = load_font(13)
+    titles = ["Original", "Heatmap", "Heatmap + GT", "Refined mask + GT"]
+    for index, title in enumerate(titles):
+        draw.text((index * (panel_size + gap) + 4, 2), title, fill=(230, 230, 230), font=font)
+    note_font = load_font(12)
+    if sample_title:
+        draw.text((4, 16), sample_title[:80], fill=(180, 180, 180), font=note_font)
+    if not gt_available:
+        draw.text((2 * (panel_size + gap) + 4, header + 4), "GT unavailable", fill=(255, 255, 0), font=note_font)
+        draw.text((3 * (panel_size + gap) + 4, header + 4), "GT unavailable", fill=(255, 255, 0), font=note_font)
+    elif gt_bool is not None and not gt_bool.any():
+        draw.text((2 * (panel_size + gap) + 4, header + 4), "GT empty", fill=(180, 255, 180), font=note_font)
+        draw.text((3 * (panel_size + gap) + 4, header + 4), "GT empty", fill=(180, 255, 180), font=note_font)
+    if pred_mask is None or mask_status == "unavailable":
+        draw.text((3 * (panel_size + gap) + 4, header + 20), "Mask unavailable: threshold missing", fill=(255, 180, 180), font=note_font)
+    return np.asarray(canvas)
+
+
+def save_contact_sheet(panels: Sequence[np.ndarray], path: str, header: str, footer: str,
+                       rows_per_page: int = 8) -> list:
+    """把已经画好的四列图分页拼起来。不重新推理，也不改预测。"""
+    from PIL import Image, ImageDraw
+
+    if rows_per_page < 1:
+        raise ValueError("rows_per_page 必须为正")
+    os_makedirs = __import__("os").makedirs
+    os_makedirs(__import__("os").path.dirname(path) or ".", exist_ok=True)
+    written = []
+    font = load_font(16)
+    small = load_font(13)
+    pages = [panels[start:start + rows_per_page] for start in range(0, max(len(panels), 1), rows_per_page)]
+    if not panels:
+        pages = [[]]
+    for page_index, page in enumerate(pages, start=1):
+        row_h = 0 if not page else page[0].shape[0]
+        row_w = 0 if not page else page[0].shape[1]
+        margin = 28
+        height = margin * 2 + max(len(page), 1) * (row_h + 10)
+        canvas = Image.new("RGB", (max(row_w, 640), height), (0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((8, 4), header[:180], fill=(230, 230, 230), font=font)
+        for row_index, panel in enumerate(page):
+            canvas.paste(Image.fromarray(panel), (0, margin + row_index * (row_h + 10)))
+        draw.text((8, height - 22), f"{footer[:140]}  {page_index}/{len(pages)}", fill=(180, 180, 180), font=small)
+        stem, ext = __import__("os").path.splitext(path)
+        page_path = path if len(pages) == 1 else f"{stem}_{page_index:03d}{ext or '.png'}"
+        canvas.save(page_path)
+        written.append(page_path)
+    return written
 
 
 def render(amap: np.ndarray, gray: np.ndarray, calib: AmapCalibration,

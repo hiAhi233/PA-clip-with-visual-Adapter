@@ -13,7 +13,12 @@ from .inlayer_adapter import (
     OrganAdapterBank,
     install_inlayer_adapters,
 )
-from .model import TextSideAnomalyModel
+from .visual_inlayer_adapter import (
+    install_visual_inlayer_adapters,
+    uninstall_visual_inlayer_adapters,
+    visual_encoder_blocks,
+)
+from .model import TextSideAnomalyModel, load_trained_model
 from .losses import (
     text_separation_loss,
     global_alignment_loss,
@@ -32,7 +37,11 @@ __all__ = [
     "InLayerBottleneckAdapter",
     "OrganAdapterBank",
     "install_inlayer_adapters",
+    "install_visual_inlayer_adapters",
+    "uninstall_visual_inlayer_adapters",
+    "visual_encoder_blocks",
     "TextSideAnomalyModel",
+    "load_trained_model",
     "text_separation_loss",
     "global_alignment_loss",
     "local_alignment_loss",

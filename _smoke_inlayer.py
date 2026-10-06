@@ -79,9 +79,12 @@ def main() -> int:
     ids = model.tokenizer(["a normal chest CT"]).to(device)
     with torch.no_grad():
         t1 = model.encode_text_tokens(ids)
-        bank_backup, model.inlayer_bank = model.inlayer_bank, None
+        # 包装闭包持有 bank，把 model.inlayer_bank 换成 None 关不掉适配器。
+        model.inlayer_bank.set_active(None)
         t0 = model.encode_text_tokens(ids)
-        model.inlayer_bank = bank_backup
+        model.inlayer_bank.set_active(ORGAN)
+        for p in model.text_adapter.parameters():
+            p.requires_grad = False
     d = (t1 - t0).abs().max().item()
     rs = [ad.up.weight.abs().max().item() for ad in model.inlayer_bank.adapters[ORGAN]]
     print(f"[2] 开/关层内适配器的嵌入最大差={d:.3e}；各槽 |W_up|max 最大={max(rs):.3e}")

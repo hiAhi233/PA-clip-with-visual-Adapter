@@ -51,6 +51,17 @@ class Config:
     num_workers: int = 4
     device: str = "cuda"
 
+    # ---- 视觉侧层内适配器（默认关闭，旧实验仍走原来的输出端/文本层内路径）----
+    visual_inlayer_enabled: bool = False
+    visual_inlayer_layers: List[int] = field(default_factory=lambda: [5, 8, 11])
+    visual_inlayer_positions: List[str] = field(default_factory=lambda: ["attn", "ffn"])
+    visual_inlayer_bottleneck: int = 64
+    visual_inlayer_lambda: float = 0.1
+    # text：训练文本侧，视觉层内适配器旁路；visual：冻结文本、训练视觉；joint：双侧一起训练
+    train_stage: str = "text"
+    # 由入口显式打开。打开后输出端 ResidualTextAdapter 的 λ 置零并冻结，加载 checkpoint 后会再执行一次
+    freeze_output_text_adapter: bool = False
+
     # ---- 数据 ----
     data_root: str = "data"              # 含 normal/ 与 abnormal/ 子目录
     mask_root: Optional[str] = None      # 病灶掩码目录（训练局部对齐用）

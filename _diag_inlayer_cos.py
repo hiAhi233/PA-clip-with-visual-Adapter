@@ -4,16 +4,18 @@
 参数多 6 倍、自由度更大，必须单独量一次，否则"还是在过拟合支持集"这个机制解释只是推测。
 
 用法（服务器）：
-    python _diag_inlayer_cos.py fewshot_ckpt/*_s0.pt
+    python _diag_inlayer_cos.py fewshot_ckpt/*_s0*.pt
 """
 import itertools
+import os
 import sys
 
 import torch
 import torch.nn.functional as F
 
 from text_side_anomaly.config import Config
-from text_side_anomaly.model import TextSideAnomalyModel
+from text_side_anomaly.model import TextSideAnomalyModel, _is_v2_checkpoint, _torch_load
+from text_side_anomaly.prompts import resolve_prompt_set
 
 import thymoma_local as TL
 
@@ -26,7 +28,7 @@ def build(mode: str, prompts):
     if mode == "inlayer":
         inlayer = {"organs": [ORGAN], "organ": ORGAN, "bottleneck": 64,
                    "layers": [8, 9, 10, 11], "positions": ("attn", "ffn")}
-    cfg = Config(device="cuda", levels=prompts.levels)
+    cfg = Config(device="cuda", levels=prompts.levels, freeze_output_text_adapter=mode == "inlayer")
     model = TextSideAnomalyModel(cfg, inlayer=inlayer).to("cuda")
     if mode == "inlayer":
         # 与 fewshot_run.build_model 完全一致：输出端压恒等并冻住
@@ -65,14 +67,22 @@ def main():
         torch.cuda.empty_cache()
 
     for path in sys.argv[1:]:
-        mode = "inlayer" if "inlayer" in path else "output"
-        m = build(mode, prompts)
-        sd = torch.load(path, map_location="cuda")
-        missing, unexpected = m.load_state_dict(sd, strict=False)
-        if unexpected:
-            print(f"  ! 意外的键 {unexpected[:3]}")
-        report(m, prompts, f"[训练后] {path.split('/')[-1]}")
-        del m, sd
+        blob = _torch_load(path, map_location="cpu")
+        if _is_v2_checkpoint(blob):
+            prompt_name = resolve_prompt_set(None, blob.get("prompt_set"), TL.PROMPT_SETS, PROMPT, loading=True)
+            run_prompts = TL.PROMPT_SETS[prompt_name]
+            m = TextSideAnomalyModel.from_arch_spec(blob["config"], device="cuda")
+        else:
+            # 历史脚本只支持 sentence 的旧文本实验；结构由权重键判断，不能猜文件名。
+            print(f"[legacy] {path} 无提示词元数据，按历史脚本约定使用 {PROMPT}")
+            run_prompts = prompts
+            mode = "inlayer" if any(key.startswith("inlayer_bank.") for key in blob) else "output"
+            m = build(mode, run_prompts)
+        m.load_checkpoint_blob(blob)
+        if list(m.cfg.levels) != list(run_prompts.levels):
+            raise ValueError("checkpoint 层级与提示词层级不一致")
+        report(m, run_prompts, f"[训练后] {os.path.basename(path)}")
+        del m, blob
         torch.cuda.empty_cache()
 
 

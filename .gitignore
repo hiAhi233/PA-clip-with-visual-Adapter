@@ -2,6 +2,9 @@
 data/
 data_pneumonia/
 thymoma_slices/
+brain_mri/
+brain_mri_masks/
+runs/
 
 # ---- 模型权重（748MB，超出 GitHub 100MB 单文件限制）----
 thymoma_local.pt

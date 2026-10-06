@@ -8,6 +8,7 @@
 """
 
 import glob
+import json
 import os
 import sys
 
@@ -21,8 +22,12 @@ from text_side_anomaly.config import Config
 from text_side_anomaly.dataset import _gray2clip
 from text_side_anomaly.losses import TotalLoss
 from text_side_anomaly.metrics import pixel_metrics
-from text_side_anomaly.model import TextSideAnomalyModel
-from text_side_anomaly.prompts import ThreeLevelPrompts
+from text_side_anomaly.model import (
+    TextSideAnomalyModel,
+    _is_v2_checkpoint,
+    _torch_load,
+)
+from text_side_anomaly.prompts import ThreeLevelPrompts, resolve_prompt_set
 from text_side_anomaly.thymoma_dataset import (
     ThymomaSliceDataset,
     case_ids,
@@ -266,20 +271,54 @@ def encode_anchors_cached(model, tok):
     return anchors
 
 
+def postprocess_config_for_checkpoint(metadata=None):
+    """旧胸腺瘤定位权重没有正常病例监督，不能用新建 Config 的默认 w_global 打开融合。"""
+    from text_side_anomaly.postprocess import build_postprocess_config
+
+    meta = dict(metadata or {})
+    if meta.get("global_supervision_enabled") is None and meta.get("w_global") is None and not (
+        isinstance(meta.get("loss"), dict) and meta["loss"].get("w_global") is not None
+    ):
+        meta["global_supervision_enabled"] = False
+        meta["w_global"] = 0.0
+    return build_postprocess_config(
+        meta.get("score_mode"),
+        meta,
+        topk_ratio=float(meta.get("topk_ratio", 0.05)),
+        mask_mode=meta.get("mask_mode") or "fixed",
+        global_weight=meta.get("global_weight"),
+    )
+
+
+def _thymoma_supervision(model) -> dict:
+    meta = dict(getattr(model, "checkpoint_meta", None) or {})
+    if meta.get("global_supervision_enabled") is None and not (
+        isinstance(meta.get("loss"), dict) and meta["loss"].get("w_global") is not None
+    ):
+        meta["global_supervision_enabled"] = False
+        meta["w_global"] = 0.0
+    model.checkpoint_meta = meta
+    return meta
+
+
 @torch.no_grad()
 def evaluate(model, anchors, loader, device):
-    """测试集 patch 级定位指标（14×14）。"""
+    """测试集 patch 级定位指标（14×14）。前向在无梯度下取数，避免 .numpy() 碰到 requires_grad。"""
     model.eval()
+    config = postprocess_config_for_checkpoint(_thymoma_supervision(model))
     enc = model.encode_anchors(anchors)
     maps, masks = [], []
     for batch in loader:
         images = batch["image"].to(device)
         out = model(images, enc)
-        maps.append(out["anomaly_map"].cpu())
-        masks.append(batch["mask"])
+        amap = out["anomaly_map"].detach().cpu()
+        maps.append(amap)
+        masks.append(batch["mask"].detach() if torch.is_tensor(batch["mask"]) else batch["mask"])
     maps = torch.cat(maps).numpy()
     masks = torch.cat(masks).numpy()
-    return pixel_metrics(maps, masks)
+    metrics = pixel_metrics(maps, masks)
+    metrics["postprocess"] = config.to_dict()
+    return metrics
 
 
 # ---------------------------------------------------------------------- #
@@ -437,6 +476,135 @@ def save_heatmaps(model, anchors, files, device, out_dir, n=6, calib=None):
         print(f"  {fn} amap[min/mean/max]={amap.min():+.3f}/{amap.mean():+.3f}/{amap.max():+.3f}")
 
 
+def _thymoma_record(path, model, encoded, device):
+    payload = np.load(path)
+    gray = payload["image"].astype(np.float32)
+    gt = payload["mask224"].astype(np.float32) if "mask224" in payload.files else None
+    image = _gray2clip(gray).unsqueeze(0).to(device)
+    out = model(image, encoded)
+    return {
+        "sample_id": os.path.basename(path),
+        "raw_map": out["anomaly_map"][0].detach().cpu().numpy(),
+        "score_global": float(out["cls_probs"][0].detach().cpu()),
+        "gray01": gray,
+        "label": 1,
+        "gt_mask_high": None if gt is None else gt > 0.5,
+        "gt_available": gt is not None,
+    }
+
+
+@torch.no_grad()
+def calibrate_thymoma_predictions(model, anchors, val_files, test_files, device):
+    """验证集冻结 0～1 像素阈值，再在测试集上生成掩码并计算 Dice。"""
+    from text_side_anomaly.inference import apply_postprocess
+    from text_side_anomaly.metrics import choose_pixel_threshold, mask_overlap_metrics
+    from text_side_anomaly.postprocess import OperatingThresholds
+
+    model.eval()
+    config = postprocess_config_for_checkpoint(_thymoma_supervision(model))
+    encoded = model.encode_anchors(anchors)
+    temperature = 0.07 if getattr(model, "cfg", None) is None else float(model.cfg.temperature)
+    reason = None
+    pixel_threshold = None
+    val_raw = [_thymoma_record(path, model, encoded, device) for path in val_files]
+    if not val_raw:
+        reason = "验证数据不足，没有验证切片，无法完成校准"
+    else:
+        preview = apply_postprocess(val_raw, config, OperatingThresholds(), temperature)
+        usable = [item for item in preview if item.get("gt_available") and item.get("gt_mask_high") is not None]
+        if not usable:
+            reason = "验证数据不足，没有高分辨率标注，无法完成校准"
+        else:
+            masks = np.stack([np.asarray(item["gt_mask_high"], dtype=np.float32) for item in usable])
+            if len(np.unique(masks > 0)) < 2:
+                reason = "验证集掩码不同时包含病灶和背景，无法完成校准"
+            else:
+                pixel_threshold = float(choose_pixel_threshold(
+                    np.stack([item["score_map_refined"] for item in usable]),
+                    masks,
+                ))
+    operating = OperatingThresholds(
+        pixel_threshold=pixel_threshold,
+        score_space="post_v1_probability_score",
+        pixel_threshold_source="val" if pixel_threshold is not None else "unavailable",
+        image_threshold_source="none",
+    )
+    test_raw = [_thymoma_record(path, model, encoded, device) for path in test_files]
+    processed = apply_postprocess(test_raw, config, operating, temperature) if test_raw else []
+    if pixel_threshold is None:
+        metrics = {
+            "dice_micro": None,
+            "iou_micro": None,
+            "calibration": "unavailable",
+            "reason": reason or "无法完成校准",
+            "pixel_threshold": None,
+            "pixel_threshold_source": "unavailable",
+        }
+    else:
+        metrics = mask_overlap_metrics(
+            [item["pred_mask"] for item in processed],
+            [item["gt_mask_high"] for item in processed],
+            [bool(item.get("gt_available") and item.get("pred_mask") is not None) for item in processed],
+        )
+        metrics["calibration"] = "ok"
+        metrics["pixel_threshold"] = pixel_threshold
+        metrics["pixel_threshold_source"] = "val"
+    if reason and pixel_threshold is None:
+        print(f"[post] {reason}")
+    return {"config": config.to_dict(), "thresholds": operating, "metrics": metrics, "records": processed}
+
+
+@torch.no_grad()
+def save_formal_figures(model, anchors, files, device, out_dir, n=6, thresholds=None):
+    """用 checkpoint 对应的后处理配置画四列图，不再各存一张单幅叠加。"""
+    from text_side_anomaly.postprocess import OperatingThresholds, postprocess_one
+    from text_side_anomaly.visualize import render_four_panel, save_contact_sheet
+
+    os.makedirs(out_dir, exist_ok=True)
+    model.eval()
+    config = postprocess_config_for_checkpoint(_thymoma_supervision(model))
+    enc = model.encode_anchors(anchors)
+    operating = thresholds or OperatingThresholds()
+    temperature = 0.07 if getattr(model, "cfg", None) is None else float(model.cfg.temperature)
+    picked, seen = [], set()
+    for path in files:
+        case = os.path.basename(path)[:3]
+        if case not in seen:
+            picked.append(path)
+            seen.add(case)
+        if len(picked) >= n:
+            break
+    if not picked:
+        raise RuntimeError("没有预测记录，不能把出图标成完成")
+    panels = []
+    row_dir = os.path.join(out_dir, "figures", "rows")
+    os.makedirs(row_dir, exist_ok=True)
+    for path in picked:
+        payload = np.load(path)
+        gray = payload["image"].astype(np.float32)
+        gt = payload["mask224"].astype(np.float32) if "mask224" in payload.files else None
+        image = _gray2clip(gray).unsqueeze(0).to(device)
+        out = model(image, enc)
+        raw = out["anomaly_map"][0].detach().cpu().numpy()
+        score = float(out["cls_probs"][0].detach().cpu())
+        prediction = postprocess_one(raw, score, gray, temperature, config, operating)
+        info = prediction.get("mask_info") or {}
+        panel = render_four_panel(
+            gray, prediction["score_map_high"], prediction.get("pred_mask"), gt, gt is not None,
+            mask_status=info.get("mask_status", "unavailable"),
+            sample_title=os.path.basename(path),
+        )
+        stem = os.path.basename(path).replace(".npz", "")
+        Image.fromarray(panel).save(os.path.join(row_dir, stem + ".png"))
+        panels.append(panel)
+        print(f"  {stem} score_local={prediction['score_local']:.3f} mask={info.get('mask_status')}")
+    save_contact_sheet(
+        panels, os.path.join(out_dir, "figures", "overview.png"),
+        "Original | Heatmap | Heatmap + GT | Refined mask + GT",
+        "局部异常分数 0–1；绿色为 GT 轮廓，红色为预测掩码",
+    )
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -467,6 +635,22 @@ def main():
                         help="插进哪些 Transformer 层（0 起，文本塔共 12 层）")
     parser.add_argument("--inlayer-positions", type=str, default="attn,ffn",
                         help="层内插入点：attn=attention 之后、ffn=FFN 之后（Houlsby 的两个点）")
+    parser.add_argument("--visual-inlayer", action="store_true",
+                        help="在视觉 ViT block 的 attention/FFN 残差之后插入适配器。默认关闭，"
+                             "旧实验不会装视觉适配器")
+    parser.add_argument("--visual-inlayer-layers", type=str, default="5,8,11",
+                        help="视觉插入层（0 起）。默认 5,8,11，与当前三个读取层相同")
+    parser.add_argument("--visual-inlayer-positions", type=str, default="attn,ffn",
+                        help="视觉插入点，只能是 attn 和 ffn，都接在残差相加之后")
+    parser.add_argument("--visual-inlayer-bottleneck", type=int, default=64)
+    parser.add_argument("--visual-inlayer-lambda", type=float, default=0.1,
+                        help="视觉残差系数初值。参数名仍是 lambda_t")
+    parser.add_argument("--train-stage", type=str, default=None, choices=["text", "visual", "joint"],
+                        help="text=训练文本侧并旁路视觉；visual=冻结文本、训练视觉；"
+                             "joint=双侧一起训练。只开了视觉适配器时默认 visual，两侧都开时默认 joint")
+    parser.add_argument("--init-ckpt", type=str, default=None,
+                        help="从已有 checkpoint 继续。允许缺少新增的 visual_inlayer_bank 参数，"
+                             "缺了就从零残差开始；文本架构对不上会报错")
     parser.add_argument("--seed", type=int, default=0,
                         help="模型初始化与 DataLoader 打乱用的种子。数据划分固定 seed=0 不随之变，"
                              "这样多个种子可比。")
@@ -502,11 +686,15 @@ def main():
                         help="参考集最多用多少张切片拟合（默认全部；只影响标定，不影响指标）")
     parser.add_argument("--clean-heatmap-dir", action="store_true",
                         help="出图前清空 --heatmap-dir 里的 png；不加则目录非空时报错退出")
-    parser.add_argument("--prompt-set", type=str, default="sentence",
+    parser.add_argument("--prompt-set", type=str, default=None,
                         choices=sorted(PROMPT_SETS),
-                        help="提示词版本；sentence=改动 7 的整句版（基线 ckpt 用它训的），"
+                        help="新训练默认 sentence；加载权重默认继承 checkpoint 的版本。sentence=整句版，"
                              "short=短名词短语版（cos(d)=0.031，配合 ① 关 ② 使用）")
     args = parser.parse_args()
+    if not args.eval_only and (args.epochs < 1 or (args.steps is not None and args.steps < 1)):
+        parser.error("--epochs 和 --steps 必须是正整数")
+    if args.eval_only and args.init_ckpt:
+        parser.error("--eval-only 与 --init-ckpt 不能同时使用")
     # 小样本下默认输出名自动加后缀。--out 的默认值会直接覆盖基线 ckpt，--heatmap-dir 的默认值
     # 会往 heatmaps_thymoma/ 里写同名 png（改动 8 附录记过这个坑）。只有"没显式传参"才改。
     if args.n_support:
@@ -514,7 +702,26 @@ def main():
             args.out = f"thymoma_local_k{args.n_support}.pt"
         if args.heatmap_dir == "heatmaps_thymoma":
             args.heatmap_dir = f"heatmaps_thymoma_k{args.n_support}"
+    source_path = args.out if args.eval_only else args.init_ckpt
+    source_blob = _torch_load(source_path, map_location="cpu") if source_path else None
+    saved_prompt = source_blob.get("prompt_set") if _is_v2_checkpoint(source_blob) else None
+    try:
+        args.prompt_set = resolve_prompt_set(
+            args.prompt_set, saved_prompt, PROMPT_SETS, "sentence", loading=bool(source_path),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     prepare_heatmap_dir(args.heatmap_dir, clean=args.clean_heatmap_dir)
+
+    if args.train_stage is None:
+        if args.visual_inlayer and args.inlayer:
+            args.train_stage = "joint"
+        elif args.visual_inlayer:
+            args.train_stage = "visual"
+        else:
+            args.train_stage = "text"
+    # 只要启用了任一侧层内适配器，输出端那条旧残差就置零并冻结。加载后还会再执行一次。
+    freeze_output = bool(args.inlayer or args.visual_inlayer)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -522,48 +729,80 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     anchors = PROMPT_SETS[args.prompt_set]
     # levels 必须跟提示词的层数一致：model 按 len(cfg.levels) 建融合权重，层数对不上会索引越界
-    cfg = Config(device=str(device), epochs=args.epochs, batch_size=16, lr=1e-4,
-                 levels=anchors.levels)
+    cfg = Config(
+        device=str(device), epochs=args.epochs, batch_size=16, lr=1e-4,
+        levels=anchors.levels, train_stage=args.train_stage,
+        freeze_output_text_adapter=freeze_output,
+        visual_inlayer_enabled=args.visual_inlayer,
+        visual_inlayer_layers=[int(x) for x in args.visual_inlayer_layers.split(",") if x.strip()],
+        visual_inlayer_positions=[p.strip() for p in args.visual_inlayer_positions.split(",") if p.strip()],
+        visual_inlayer_bottleneck=args.visual_inlayer_bottleneck,
+        visual_inlayer_lambda=args.visual_inlayer_lambda,
+    )
 
-    inlayer = None
-    if args.inlayer:
-        inlayer = {
-            "organs": [ORGAN], "organ": ORGAN,
-            "bottleneck": args.inlayer_bottleneck,
-            "layers": [int(x) for x in args.inlayer_layers.split(",") if x.strip()],
-            "positions": tuple(p.strip() for p in args.inlayer_positions.split(",") if p.strip()),
-        }
-    model = TextSideAnomalyModel(cfg, inlayer=inlayer).to(device)
-    if args.inlayer:
-        # 「不要加在输出后面」：把输出端 adapter 压成恒等（λ_t=0）再冻住，塔外那一路彻底不参与，
-        # 可训参数只剩层内适配器。λ_t 是可学习 Parameter，所以必须显式置零才是恒等。
-        with torch.no_grad():
-            model.text_adapter.lambda_t.data.zero_()
-        for p in model.text_adapter.parameters():
-            p.requires_grad = False
-    print(f"[prompt] set={args.prompt_set} levels={anchors.levels} "
-          f"adapter={'层内' if args.inlayer else '输出端'}")
-    tok = pre_tokenize(model, anchors, device)
-    ckpt = args.out
-
-    if args.eval_only:
+    def build_from_cli():
+        inlayer = None
         if args.inlayer:
-            # 老 ckpt（改动 7~16 产的）没有 inlayer_bank.* 键，严格加载会直接报 Missing key
-            model.load_compat(ckpt, map_location=device)
-        else:
-            model.load_state_dict(torch.load(ckpt, map_location=device))
-        print(f"已加载 checkpoint -> {ckpt}")
+            inlayer = {
+                "organs": [ORGAN], "organ": ORGAN,
+                "bottleneck": args.inlayer_bottleneck,
+                "layers": [int(x) for x in args.inlayer_layers.split(",") if x.strip()],
+                "positions": tuple(p.strip() for p in args.inlayer_positions.split(",") if p.strip()),
+            }
+        visual = None
+        if args.visual_inlayer:
+            visual = {
+                "organs": [ORGAN], "organ": ORGAN,
+                "bottleneck": args.visual_inlayer_bottleneck,
+                "lambda_t": args.visual_inlayer_lambda,
+                "layers": list(cfg.visual_inlayer_layers),
+                "positions": tuple(cfg.visual_inlayer_positions),
+            }
+        return TextSideAnomalyModel(cfg, inlayer=inlayer, visual_inlayer=visual).to(device)
+
+    ckpt = args.out
+    if args.eval_only and _is_v2_checkpoint(source_blob):
+        # 出图/评估必须按 checkpoint 里的两侧适配器重建，不能只靠当前命令行猜结构。
+        model = TextSideAnomalyModel.from_arch_spec(source_blob["config"], device=device)
+        model.load_checkpoint_blob(source_blob)
+        cfg = model.cfg
+        print(f"已按 checkpoint 架构加载 -> {ckpt} stage={model.training_stage} prompt={args.prompt_set}")
     else:
-        trainable = [p for p in model.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+        model = build_from_cli()
+        if args.eval_only:
+            model.load_checkpoint_blob(source_blob, allow_missing_visual=False)
+            print(f"已加载 checkpoint -> {ckpt}")
+        elif args.init_ckpt:
+            model.load_checkpoint_blob(
+                source_blob,
+                allow_missing_visual=True, resume_stage=args.train_stage, organ=ORGAN,
+            )
+            print(f"已从 {args.init_ckpt} 初始化，当前阶段={model.training_stage}")
+    del source_blob
+    if list(cfg.levels) != list(anchors.levels):
+        raise ValueError("checkpoint 层级与提示词层级不一致")
+    side = []
+    if args.inlayer or model.inlayer_bank is not None:
+        side.append("文本层内")
+    if args.visual_inlayer or model.visual_inlayer_bank is not None:
+        side.append("视觉层内")
+    print(f"[prompt] set={args.prompt_set} levels={anchors.levels} "
+          f"adapter={'+'.join(side) if side else '输出端'} stage={model.training_stage}")
+    tok = pre_tokenize(model, anchors, device)
+
+    if not args.eval_only:
+        # 视觉阶段文本锚点不再更新，纯文本分离/多样性项不会训练视觉参数。
+        w_text = 0.0 if model.training_stage == "visual" else 1.0
+        w_div = 0.0 if model.training_stage == "visual" else args.w_div
+        opt = model.build_optimizer(lr=cfg.lr, weight_decay=cfg.weight_decay)
         # 无正常样本：只训练文本分离 + 局部对齐（+ 可选的三层多样性项）
         crit = TotalLoss(
-            margin=cfg.margin, w_text=1.0, w_global=0.0, w_local=1.0,
-            margin_lo=args.margin_lo, margin_d=args.margin_d, w_div=args.w_div,
+            margin=cfg.margin, w_text=w_text, w_global=0.0, w_local=1.0,
+            margin_lo=args.margin_lo, margin_d=args.margin_d, w_div=w_div,
             w_level=args.w_level,
         )
         print(f"[loss] margin={cfg.margin} margin_lo={args.margin_lo} "
-              f"w_div={args.w_div} margin_d={args.margin_d} w_level={args.w_level}")
+              f"w_text={w_text} w_div={w_div} margin_d={args.margin_d} w_level={args.w_level}")
 
         splits = make_slice_splits("thymoma_slices", seed=0)
         # 支持集只从 train 划分抽，按病例抽（同病例切片高度相关，混抽会把有效样本数虚高），
@@ -573,37 +812,59 @@ def main():
             leak = case_ids(support) & case_ids(splits["test"])
             assert not leak, f"支持集与 test 病例重叠，会泄漏：{leak}"
         train_ds = ThymomaSliceDataset("thymoma_slices", files=support)
+        if not len(train_ds):
+            raise ValueError("训练支持集为空")
         train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
 
-        n_epochs = cfg.epochs
-        align = ""
-        if args.steps:
-            # 向上取整：batch 数除不尽就多跑一个 epoch，宁可多不可少（按步数对齐是硬约束）
-            n_epochs = max(1, (args.steps + len(train_loader) - 1) // len(train_loader))
-            align = f"（--steps {args.steps} 向上取整）"
+        target_steps = args.steps if args.steps is not None else cfg.epochs * len(train_loader)
+        n_epochs = (target_steps + len(train_loader) - 1) // len(train_loader)
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"[thymoma-local] train_slices={len(train_ds)}"
               f"（{len(case_ids(support))} 个病例）device={device} "
-              f"可训练参数={sum(p.numel() for p in trainable)}")
-        print(f"[thymoma-local] 优化 {n_epochs} epoch × {len(train_loader)} batch "
-              f"= {n_epochs * len(train_loader)} 步{align}")
+              f"可训练参数={n_train}")
+        print(f"[thymoma-local] 优化 {target_steps} 步，最多 {n_epochs} epoch")
 
+        cached_enc = None
+        if model.training_stage == "visual":
+            model.eval()
+            with torch.no_grad():
+                cached_enc = encode_anchors_cached(model, tok)
+            print("[anchor] 视觉阶段文本权重固定，锚点只编码一次")
+
+        completed_steps = 0
         for epoch in range(n_epochs):
             model.train()
             total = 0.0
+            epoch_steps = 0
             for batch in train_loader:
                 images = batch["image"].to(device)
                 masks = batch["mask"].to(device)
                 labels = batch["label"].to(device)
-                enc = encode_anchors_cached(model, tok)
+                enc = cached_enc if cached_enc is not None else encode_anchors_cached(model, tok)
                 out = model(images, enc)
                 loss = crit(enc, out, labels, masks)
                 opt.zero_grad()
                 loss["total"].backward()
                 opt.step()
                 total += loss["total"].item()
-            print(f"[epoch {epoch + 1}/{n_epochs}] loss={total / len(train_loader):.4f}")
+                completed_steps += 1
+                epoch_steps += 1
+                if completed_steps >= target_steps:
+                    break
+            print(f"[epoch {epoch + 1}/{n_epochs}] step={completed_steps}/{target_steps} "
+                  f"loss={total / epoch_steps:.4f}")
 
-        torch.save(model.state_dict(), ckpt)
+        model.save_checkpoint(
+            ckpt, optimizer=opt, prompt_set=args.prompt_set,
+            step=completed_steps, seed=args.seed,
+            support_set=list(support), split_id="thymoma_slices:seed0",
+            loss={
+                "w_text": w_text, "w_global": 0.0, "w_local": 1.0, "w_div": w_div,
+                "w_level": args.w_level, "margin_lo": args.margin_lo, "margin_d": args.margin_d,
+            },
+            global_supervision_enabled=False,
+            w_global=0.0,
+        )
         print(f"已保存 checkpoint -> {ckpt}")
 
     splits = make_slice_splits("thymoma_slices", seed=0)
@@ -611,20 +872,28 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
 
     m = evaluate(model, anchors, test_loader, device)
-    print("\n===== 定位评估（test，patch 级 14×14）=====")
+    print("\n===== 定位评估（test，patch 级 14×14；Dice/IoU 为 test 最优阈值）=====")
     print(f"  pixel AUROC={m['pixel_auroc']:.4f}  Dice={m['dice']:.4f}  IoU={m['iou']:.4f}")
 
-    # 出图标定：纯显示层，放在 evaluate 之后，不动任何评估口径
+    # 旧单幅叠加只留给 --legacy-display。默认先在验证集定阈值，再出带预测掩码的四列图。
     if args.legacy_display:
-        calib = None
         print("[display] 旧口径：amap/AMAP_SCALE(0.3) + 双线性（改动 8 之前）")
+        save_heatmaps(model, anchors, splits["test"], device, args.heatmap_dir, n=6, calib=None)
+        print(f"热力图已生成到 {args.heatmap_dir}/（绿色=GT 肿瘤轮廓，红色=预测热区）")
     else:
-        calib = fit_calibration(model, anchors, splits, device, split=args.calib_split,
-                                batch_size=cfg.batch_size, lo_pct=args.calib_lo_pct,
-                                hi_pct=args.calib_hi_pct, max_slices=args.calib_max_slices)
-
-    save_heatmaps(model, anchors, splits["test"], device, args.heatmap_dir, n=6, calib=calib)
-    print(f"热力图已生成到 {args.heatmap_dir}/（绿色=GT 肿瘤轮廓，红色=预测热区）")
+        formal = calibrate_thymoma_predictions(model, anchors, splits["val"], splits["test"], device)
+        if formal["metrics"].get("calibration") == "ok":
+            print(
+                f"[post] 验证集像素阈值={formal['metrics']['pixel_threshold']:.4f}  "
+                f"test Dice={formal['metrics']['dice_micro']:.4f}  IoU={formal['metrics']['iou_micro']:.4f}"
+            )
+        with open(os.path.join(args.heatmap_dir, "formal_metrics.json"), "w", encoding="utf-8") as handle:
+            json.dump(formal["metrics"], handle, ensure_ascii=False, indent=2)
+        save_formal_figures(
+            model, anchors, splits["test"], device, args.heatmap_dir, n=6,
+            thresholds=formal["thresholds"],
+        )
+        print(f"四列图已生成到 {args.heatmap_dir}/figures/")
 
 
 if __name__ == "__main__":
